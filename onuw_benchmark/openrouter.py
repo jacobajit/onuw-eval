@@ -12,6 +12,10 @@ from onuw_benchmark.schemas import DiscussionMessage, NightAction, Vote, validat
 
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MAX_TOKENS = 16000
+DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_DISCUSSION_MESSAGE_MAX_CHARS = 2000
+DEFAULT_REASONING_SUMMARY_MAX_CHARS = 4000
 
 
 class OpenRouterError(RuntimeError):
@@ -44,6 +48,9 @@ class LLMCallRecord:
     request_context: dict[str, Any]
     structured_output: dict[str, Any]
     reasoning_effort: str
+    max_tokens: int
+    discussion_message_max_chars: int | None = None
+    reasoning_summary_max_chars: int | None = None
     exposed_reasoning: Any = None
     exposed_reasoning_details: Any = None
     finish_reason: str | None = None
@@ -59,6 +66,9 @@ class LLMCallRecord:
             "request_context": self.request_context,
             "structured_output": self.structured_output,
             "reasoning_effort": self.reasoning_effort,
+            "max_tokens": self.max_tokens,
+            "discussion_message_max_chars": self.discussion_message_max_chars,
+            "reasoning_summary_max_chars": self.reasoning_summary_max_chars,
             "exposed_reasoning": self.exposed_reasoning,
             "exposed_reasoning_details": self.exposed_reasoning_details,
             "finish_reason": self.finish_reason,
@@ -93,8 +103,8 @@ class OpenRouterClient:
         schema_name: str,
         schema: dict[str, Any],
         temperature: float = 0.7,
-        max_tokens: int = 4000,
-        reasoning_effort: str = "medium",
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ) -> dict[str, Any]:
         return self.chat_json_result(
             model=model,
@@ -114,8 +124,8 @@ class OpenRouterClient:
         schema_name: str,
         schema: dict[str, Any],
         temperature: float = 0.7,
-        max_tokens: int = 4000,
-        reasoning_effort: str = "medium",
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ) -> ChatJSONResult:
         payload = {
             "model": model,
@@ -223,8 +233,10 @@ class OpenRouterAgent(PlayerAgent):
         model: str,
         client: OpenRouterClient,
         temperature: float = 0.7,
-        max_tokens: int = 4000,
-        reasoning_effort: str = "medium",
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        discussion_message_max_chars: int = DEFAULT_DISCUSSION_MESSAGE_MAX_CHARS,
+        reasoning_summary_max_chars: int = DEFAULT_REASONING_SUMMARY_MAX_CHARS,
     ) -> None:
         self.player_id = player_id
         self.model = model
@@ -232,6 +244,8 @@ class OpenRouterAgent(PlayerAgent):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.discussion_message_max_chars = discussion_message_max_chars
+        self.reasoning_summary_max_chars = reasoning_summary_max_chars
         self.call_log: list[LLMCallRecord] = []
 
     def choose_night_action(self, context: AgentContext) -> NightAction:
@@ -265,11 +279,15 @@ class OpenRouterAgent(PlayerAgent):
             step="discussion",
             context=context,
             schema_name="discussion_message",
-            schema=discussion_schema(context),
+            schema=discussion_schema(
+                context,
+                message_max_chars=self.discussion_message_max_chars,
+                reasoning_summary_max_chars=self.reasoning_summary_max_chars,
+            ),
             user_prompt=(
-                "It is your turn in the discussion. Speak as your player in one concise message. "
+                "It is your turn in the discussion. Speak as your player in one complete message. "
                 "You may tell the truth, omit information, bluff, coordinate, or accuse. "
-                "Also provide a concise private reasoning_summary for the benchmark log; it is not shown to other players."
+                "Also provide a private reasoning_summary for the benchmark log; it is not shown to other players."
             ),
         )
         return DiscussionMessage(
@@ -303,43 +321,64 @@ class OpenRouterAgent(PlayerAgent):
         schema: dict[str, Any],
         user_prompt: str,
     ) -> dict[str, Any]:
-        request_context = context_payload(context, self.model, user_prompt)
-        messages = [
-            {"role": "system", "content": system_prompt()},
-            {"role": "user", "content": json.dumps(request_context, indent=2)},
-        ]
-        result = self.client.chat_json_result(
-            model=self.model,
-            messages=messages,
-            schema_name=schema_name,
-            schema=schema,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            reasoning_effort=self.reasoning_effort,
-        )
-        self.call_log.append(
-            LLMCallRecord(
-                step=step,
-                player_id=context.player_id,
-                model=self.model,
-                schema_name=schema_name,
-                request_context=request_context,
-                structured_output=result.parsed,
-                reasoning_effort=self.reasoning_effort,
-                exposed_reasoning=result.reasoning,
-                exposed_reasoning_details=result.reasoning_details,
-                finish_reason=result.finish_reason,
-                usage=result.usage,
+        last_error: str | None = None
+        for attempt in range(3):
+            retry_text = (
+                f" Previous response failed validation: {last_error}. Return only a JSON object matching the schema."
+                if last_error
+                else ""
             )
-        )
-        return result.parsed
+            request_context = context_payload(context, self.model, user_prompt + retry_text)
+            messages = [
+                {"role": "system", "content": system_prompt()},
+                {"role": "user", "content": json.dumps(request_context, indent=2)},
+            ]
+            try:
+                result = self.client.chat_json_result(
+                    model=self.model,
+                    messages=messages,
+                    schema_name=schema_name,
+                    schema=schema,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            except OpenRouterError as exc:
+                last_error = str(exc)
+                continue
+            self.call_log.append(
+                LLMCallRecord(
+                    step=step,
+                    player_id=context.player_id,
+                    model=self.model,
+                    schema_name=schema_name,
+                    request_context=request_context,
+                    structured_output=result.parsed,
+                    reasoning_effort=self.reasoning_effort,
+                    max_tokens=self.max_tokens,
+                    discussion_message_max_chars=(
+                        self.discussion_message_max_chars if schema_name == "discussion_message" else None
+                    ),
+                    reasoning_summary_max_chars=(
+                        self.reasoning_summary_max_chars if schema_name == "discussion_message" else None
+                    ),
+                    exposed_reasoning=result.reasoning,
+                    exposed_reasoning_details=result.reasoning_details,
+                    finish_reason=result.finish_reason,
+                    usage=result.usage,
+                    validation_error=last_error,
+                )
+            )
+            return result.parsed
+        raise OpenRouterError(f"{self.model} failed to return valid structured output after retries: {last_error}")
 
 
 def system_prompt() -> str:
     return (
         "You are an agent playing One Night Ultimate Werewolf. "
-        "Optimize for your current team's win condition, but follow the game rules and output schema exactly. "
-        "You may lie or bluff during discussion. Never reveal hidden engine state you were not given."
+        "Optimize for your current team's win condition, but follow the complete ruleset in the user context "
+        "and output schema exactly. You may lie or bluff during discussion. "
+        "Never reveal hidden engine state you were not given."
     )
 
 
@@ -361,18 +400,138 @@ def context_payload(context: AgentContext, model: str, task: str) -> dict[str, A
 
 def rules_summary(context: AgentContext) -> dict[str, Any]:
     return {
-        "win_conditions": [
-            "Village team wins if at least one final Werewolf is killed.",
-            "Werewolf team wins if at least one final Werewolf exists and no final Werewolf is killed.",
-            "If no final Werewolves exist, village wins only if nobody is killed.",
-            "Tanner wins if the final Tanner is killed.",
-            "Minion wins if final Werewolves win; if no final Werewolves exist, Minion wins only if a non-Minion dies and Minion survives.",
-            "Hunter kills the player they voted for if Hunter dies.",
+        "game_setup": {
+            "format": "One Night Ultimate Werewolf, one night followed by discussion and one simultaneous vote.",
+            "cards": "There is one card per player plus exactly three face-down center cards.",
+            "initial_role": "Your initial_role is the card you woke as and determines whether you act at night.",
+            "final_role": (
+                "Your final card after all night swaps determines your team and whether you win. "
+                "Your final role may differ from your initial role unless an observation tells you."
+            ),
+            "center_cards": "Center cards are indexed 0, 1, and 2.",
+            "doppelganger": "Doppelganger is modeled in code but is not enabled in normal benchmark decks.",
+        },
+        "night_order": [
+            "Doppelganger, only in explicitly enabled experiments",
+            "Werewolf",
+            "Minion",
+            "Mason",
+            "Seer",
+            "Robber",
+            "Troublemaker",
+            "Drunk",
+            "Insomniac",
         ],
-        "private_information_boundary": (
-            "You know your initial role and observations only. Your final role may have changed unless an observation tells you."
-        ),
-        "legal_vote_targets": [player for player in context.players if player != context.player_id],
+        "role_rules": {
+            "Villager": {
+                "team": "Village",
+                "night": "Does not wake or act.",
+                "goal": "Help kill at least one final Werewolf, or if no Werewolves exist, help make sure nobody dies.",
+            },
+            "Werewolf": {
+                "team": "Werewolf",
+                "night": (
+                    "All initial Werewolves see the list of initial Werewolf players. "
+                    "If you are the only initial Werewolf, you may view exactly one center card."
+                ),
+                "actions": {"with_partners": ["none"], "lone_wolf": ["none", "view_center"]},
+                "goal": "Win if at least one final Werewolf exists and no final Werewolf is killed.",
+            },
+            "Seer": {
+                "team": "Village",
+                "night": "Choose either one other player to view, or two distinct center cards to view.",
+                "actions": {
+                    "view_player": "target_player must be exactly one other player, never yourself.",
+                    "view_two_center": "center_cards must contain exactly two distinct indices from 0, 1, and 2.",
+                },
+            },
+            "Robber": {
+                "team": "Village unless your final card changes teams",
+                "night": "Swap your own card with exactly one other player's card, then learn your new role.",
+                "actions": {"swap_with_player": "target_player must be one other player, never yourself."},
+                "important": "After swapping, you are on the team of the card you took.",
+            },
+            "Troublemaker": {
+                "team": "Village",
+                "night": "Swap the cards of exactly two distinct other players. You do not see either card.",
+                "actions": {"swap_two_players": "target_players must contain two distinct other players, never yourself."},
+            },
+            "Drunk": {
+                "team": "Village unless your final card changes teams",
+                "night": "Swap your own card with exactly one center card without looking at the card you receive.",
+                "actions": {"swap_with_center": "center_card must be one index from 0, 1, and 2."},
+                "important": "You do not learn your final role from this swap.",
+            },
+            "Insomniac": {
+                "team": "Village unless your final card changed teams",
+                "night": "Wake last and learn your own final role after all earlier swaps.",
+                "actions": ["none"],
+            },
+            "Minion": {
+                "team": "Minion/Werewolf ally",
+                "night": "See the initial Werewolf players. If the list is empty, no player started as Werewolf.",
+                "actions": ["none"],
+                "goal": (
+                    "If any final Werewolf exists, win when no final Werewolf is killed. "
+                    "If no final Werewolf exists, win only by surviving while at least one player is killed."
+                ),
+            },
+            "Mason": {
+                "team": "Village",
+                "night": "See other initial Masons. An empty list means you are the only Mason.",
+                "actions": ["none"],
+            },
+            "Hunter": {
+                "team": "Village",
+                "night": "Does not wake or act.",
+                "special_vote_rule": "If the final Hunter is killed, the player the Hunter voted for also dies.",
+            },
+            "Tanner": {
+                "team": "Tanner",
+                "night": "Does not wake or act.",
+                "goal": "Win if the final Tanner is killed. Tanner can win alongside another team.",
+            },
+        },
+        "action_rules": {
+            "legal_actions_for_this_step": context.legal_actions,
+            "night_action_choice": "Use only one of legal_actions_for_this_step. Use null for schema fields that do not apply.",
+            "player_targets": "When an action says another player, target one of the listed players other than yourself.",
+            "center_targets": "Center-card indices are integers 0, 1, and 2.",
+        },
+        "discussion_rules": {
+            "public_transcript": "discussion_transcript contains only public messages already spoken.",
+            "allowed_strategy": "You may tell the truth, omit information, bluff, coordinate, accuse, or defend yourself.",
+            "private_information_boundary": (
+                "Only use your initial role, observations, and public discussion. "
+                "Do not claim hidden engine state as known unless it was in your observations."
+            ),
+        },
+        "vote_rules": {
+            "legal_vote_targets": [player for player in context.players if player != context.player_id],
+            "self_vote": "You cannot vote for yourself.",
+            "simultaneous": "Votes are simultaneous and final.",
+            "elimination": (
+                "If every player who receives votes receives exactly one vote, nobody dies. "
+                "Otherwise, the player or players tied for the most votes die."
+            ),
+            "hunter": "If the final Hunter dies, the Hunter's vote target also dies.",
+        },
+        "win_conditions": [
+            "Cards after all night swaps are final roles and determine teams.",
+            "Village roles win if at least one final Werewolf is killed.",
+            "If no final Werewolves exist, Village roles win only if nobody is killed.",
+            "Final Werewolves win if at least one final Werewolf exists and no final Werewolf is killed.",
+            "Final Minions win with the Werewolves when final Werewolves exist and no final Werewolf is killed.",
+            "If no final Werewolves exist, final Minions win only if they survive and at least one player is killed.",
+            "Final Tanner wins if the final Tanner is killed, and this does not prevent other eligible teams from also winning.",
+        ],
+        "current_step": {
+            "player_id": context.player_id,
+            "initial_role": context.initial_role.value,
+            "active_role_for_this_step": context.current_role.value,
+            "legal_actions": context.legal_actions,
+            "legal_vote_targets": [player for player in context.players if player != context.player_id],
+        },
     }
 
 
@@ -398,16 +557,21 @@ def night_action_schema(context: AgentContext) -> dict[str, Any]:
     }
 
 
-def discussion_schema(context: AgentContext) -> dict[str, Any]:
+def discussion_schema(
+    context: AgentContext,
+    *,
+    message_max_chars: int = DEFAULT_DISCUSSION_MESSAGE_MAX_CHARS,
+    reasoning_summary_max_chars: int = DEFAULT_REASONING_SUMMARY_MAX_CHARS,
+) -> dict[str, Any]:
     return {
         "type": "object",
         "additionalProperties": False,
         "required": ["message", "claim", "accusation", "reasoning_summary"],
         "properties": {
-            "message": {"type": "string", "minLength": 1, "maxLength": 900},
+            "message": {"type": "string", "minLength": 1, "maxLength": message_max_chars},
             "claim": {"type": ["string", "null"]},
             "accusation": {"type": ["string", "null"]},
-            "reasoning_summary": {"type": "string", "maxLength": 1200},
+            "reasoning_summary": {"type": "string", "maxLength": reasoning_summary_max_chars},
         },
     }
 

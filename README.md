@@ -8,7 +8,7 @@ This is a local benchmark harness for One Night Ultimate Werewolf agents. It run
 - simultaneous voting
 - official-style elimination and win-condition resolution
 - structured JSON outputs for night actions, discussion messages, votes, and game results
-- optional OpenRouter-backed LLM agents with reasoning-effort controls
+- optional OpenRouter-backed LLM agents with configurable reasoning and output budgets
 - browsable self-contained HTML reports for completed runs
 
 Two agent providers are included:
@@ -50,6 +50,20 @@ Emit machine-readable JSON:
 python3 -m onuw_benchmark run --seed 7 --json
 ```
 
+Run multiple games and aggregate win rates:
+
+```bash
+python3 -m onuw_benchmark run --runs 50 --seed 7
+```
+
+For machine-readable aggregate data:
+
+```bash
+python3 -m onuw_benchmark run --runs 50 --seed 7 --json > results/onuw_batch_$(date +%Y%m%d_%H%M%S).json
+```
+
+Multi-run JSON includes every individual game under `runs` plus `summary.players` and `summary.models` with `games`, `wins`, `win_rate`, `killed`, and `killed_rate`. When `--seed` is provided, run `0` uses that seed and later runs increment it by one, so repeated benchmark batches are reproducible.
+
 Use custom players and role deck:
 
 ```bash
@@ -81,7 +95,9 @@ python3 -m onuw_benchmark run \
     deepseek/deepseek-v4-pro \
   --discussion-rounds 3 \
   --reasoning-effort medium \
-  --max-tokens 4000 \
+  --max-tokens 16000 \
+  --discussion-message-max-chars 2000 \
+  --reasoning-summary-max-chars 4000 \
   --seed 11 \
   --json > results/onuw_openrouter_$(date +%Y%m%d_%H%M%S).json
 ```
@@ -90,11 +106,13 @@ If you omit `--players`, the harness creates `P1`, `P2`, etc. The HTML report di
 
 The OpenRouter adapter uses structured JSON-schema outputs for night actions, discussion messages, and votes. It sets `provider.require_parameters=true` so OpenRouter should reject providers that cannot honor requested structured-output and reasoning parameters. The provider-facing schema is intentionally conservative because some providers support a narrower JSON Schema subset; the harness then applies local rule validators and retries invalid night actions with correction prompts.
 
+By default, each model turn gets a high completion budget with `--max-tokens 16000`, while reasoning effort stays at `--reasoning-effort medium`. Public discussion length is controlled separately from hidden/model reasoning: `--discussion-rounds` controls how many round-robin passes occur, `--discussion-message-max-chars` controls the maximum public message size, and `--reasoning-summary-max-chars` controls the private structured reasoning summary recorded in the benchmark log. Raise these values, including `--reasoning-effort high` or above, for less constrained debate; lower them for cheaper/shorter runs.
+
 JSON results include:
 
 - `night_events`, `transcript`, `votes`, and resolution fields
 - `game_log`, a chronological merged event stream
-- `llm_call_log`, with each model call's request context, structured output, final decision fields, usage, finish reason, requested reasoning effort, provider-exposed reasoning fields, and model-supplied reasoning summaries
+- `llm_call_log`, with each model call's request context, structured output, final decision fields, usage, finish reason, requested reasoning effort, max token budget, provider-exposed reasoning fields, and model-supplied reasoning summaries
 
 The harness requests `reasoning.effort=medium` by default. Hidden chain of thought cannot be retrieved if a provider does not expose it; in that case the log records the final structured reasoning fields and leaves `exposed_reasoning` / `exposed_reasoning_details` empty.
 

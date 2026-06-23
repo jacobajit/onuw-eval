@@ -7,7 +7,15 @@ import sys
 
 from onuw_benchmark.agents import MockAgent, PlayerAgent
 from onuw_benchmark.engine import DEFAULT_PLAYERS, DEFAULT_ROLE_DECK, GameConfig, OneNightGame, default_role_deck_for_player_count
-from onuw_benchmark.openrouter import OpenRouterAgent, OpenRouterClient, OpenRouterError
+from onuw_benchmark.openrouter import (
+    DEFAULT_DISCUSSION_MESSAGE_MAX_CHARS,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_REASONING_SUMMARY_MAX_CHARS,
+    OpenRouterAgent,
+    OpenRouterClient,
+    OpenRouterError,
+)
 from onuw_benchmark.report import write_report
 from onuw_benchmark.roles import parse_role
 
@@ -27,16 +35,34 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--provider", choices=["mock", "openrouter"], default="mock", help="agent provider")
     run_parser.add_argument("--models", nargs="+", default=None, help="one model slug per player for provider-backed agents")
     run_parser.add_argument("--temperature", type=float, default=0.7, help="LLM sampling temperature")
-    run_parser.add_argument("--max-tokens", type=int, default=4000, help="max completion tokens for each LLM turn")
+    run_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="max completion tokens for each LLM turn",
+    )
     run_parser.add_argument(
         "--reasoning-effort",
         choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        default="medium",
+        default=DEFAULT_REASONING_EFFORT,
         help="OpenRouter reasoning effort for reasoning-capable models",
+    )
+    run_parser.add_argument(
+        "--discussion-message-max-chars",
+        type=int,
+        default=DEFAULT_DISCUSSION_MESSAGE_MAX_CHARS,
+        help="max public discussion message length requested from each LLM turn",
+    )
+    run_parser.add_argument(
+        "--reasoning-summary-max-chars",
+        type=int,
+        default=DEFAULT_REASONING_SUMMARY_MAX_CHARS,
+        help="max private reasoning_summary length requested from each LLM discussion turn",
     )
     run_parser.add_argument("--openrouter-api-key", default=None, help="OpenRouter API key; defaults to OPENROUTER_API_KEY")
     run_parser.add_argument("--discussion-rounds", type=int, default=3, help="round-robin passes before voting")
     run_parser.add_argument("--seed", type=int, default=None, help="deterministic RNG seed")
+    run_parser.add_argument("--runs", type=int, default=1, help="number of games to run and aggregate")
     run_parser.add_argument("--json", action="store_true", help="print full JSON result")
     run_parser.add_argument(
         "--allow-doppelganger",
@@ -51,8 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_command(args: argparse.Namespace) -> int:
+    validate_budget_args(args)
     players = resolve_players(args)
     role_deck = [parse_role(role) for role in args.roles] if args.roles else default_role_deck_for_player_count(len(players))
+    if args.runs < 1:
+        raise ValueError("--runs must be at least 1")
     config = GameConfig(
         players=players,
         role_deck=role_deck,
@@ -60,6 +89,9 @@ def run_command(args: argparse.Namespace) -> int:
         seed=args.seed,
         allow_doppelganger=args.allow_doppelganger,
     )
+    if args.runs > 1:
+        return run_multiple_games(args, config)
+
     agents = build_agents(args, config.players)
     result = OneNightGame(config, agents=agents).run()
     if args.json:
@@ -92,6 +124,113 @@ def run_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_multiple_games(args: argparse.Namespace, base_config: GameConfig) -> int:
+    runs: list[dict[str, object]] = []
+    for run_index in range(args.runs):
+        seed = None if base_config.seed is None else base_config.seed + run_index
+        config = GameConfig(
+            players=list(base_config.players),
+            role_deck=list(base_config.role_deck),
+            discussion_rounds=base_config.discussion_rounds,
+            seed=seed,
+            allow_doppelganger=base_config.allow_doppelganger,
+        )
+        agents = build_agents(args, config.players)
+        result = OneNightGame(config, agents=agents).run()
+        run_data = result.to_dict()
+        run_data["run_index"] = run_index
+        run_data["agents"] = agent_metadata(agents)
+        run_data["game_log"] = game_log(result)
+        run_data["llm_call_log"] = llm_call_log(agents)
+        runs.append(run_data)
+
+    data = {
+        "type": "multi_run",
+        "run_count": args.runs,
+        "provider": args.provider,
+        "players": list(base_config.players),
+        "role_deck": [role.value for role in base_config.role_deck],
+        "discussion_rounds": base_config.discussion_rounds,
+        "seed": base_config.seed,
+        "runs": runs,
+        "summary": summarize_runs(runs, players=base_config.players),
+    }
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    print("One Night Ultimate Werewolf benchmark")
+    print(f"Runs: {args.runs}")
+    print(f"Players: {', '.join(base_config.players)}")
+    print()
+    print("Win rates by model:")
+    for model, stats in sorted(data["summary"]["models"].items()):
+        print(format_stats_line(model, stats))
+    print()
+    print("Win rates by player:")
+    for player in base_config.players:
+        print(format_stats_line(player, data["summary"]["players"][player]))
+    return 0
+
+
+def summarize_runs(runs: list[dict[str, object]], *, players: list[str]) -> dict[str, object]:
+    player_stats = {
+        player: {"games": 0, "wins": 0, "win_rate": 0.0, "killed": 0, "killed_rate": 0.0, "model": "unknown"}
+        for player in players
+    }
+    model_stats: dict[str, dict[str, object]] = {}
+
+    for run in runs:
+        winners = set(run.get("winners", []))
+        killed = set(run.get("killed", []))
+        agents = run.get("agents", {})
+        if not isinstance(agents, dict):
+            agents = {}
+        run_players = run.get("players", players)
+        if not isinstance(run_players, list):
+            run_players = players
+        for player in run_players:
+            if not isinstance(player, str):
+                continue
+            player_entry = player_stats.setdefault(
+                player,
+                {"games": 0, "wins": 0, "win_rate": 0.0, "killed": 0, "killed_rate": 0.0, "model": "unknown"},
+            )
+            agent = agents.get(player, {})
+            model = agent.get("model", "unknown") if isinstance(agent, dict) else "unknown"
+            player_entry["model"] = model
+            model_entry = model_stats.setdefault(
+                str(model),
+                {"games": 0, "wins": 0, "win_rate": 0.0, "killed": 0, "killed_rate": 0.0},
+            )
+            for entry in (player_entry, model_entry):
+                entry["games"] = int(entry["games"]) + 1
+                if player in winners:
+                    entry["wins"] = int(entry["wins"]) + 1
+                if player in killed:
+                    entry["killed"] = int(entry["killed"]) + 1
+
+    for entry in [*player_stats.values(), *model_stats.values()]:
+        games = int(entry["games"])
+        entry["win_rate"] = int(entry["wins"]) / games if games else 0.0
+        entry["killed_rate"] = int(entry["killed"]) / games if games else 0.0
+
+    return {
+        "runs": len(runs),
+        "players": player_stats,
+        "models": model_stats,
+    }
+
+
+def format_stats_line(label: str, stats: dict[str, object]) -> str:
+    games = int(stats["games"])
+    wins = int(stats["wins"])
+    killed = int(stats["killed"])
+    win_rate = float(stats["win_rate"]) * 100
+    killed_rate = float(stats["killed_rate"]) * 100
+    return f"  {label}: {wins}/{games} wins ({win_rate:.1f}%), killed {killed}/{games} ({killed_rate:.1f}%)"
+
+
 def resolve_players(args: argparse.Namespace) -> list[str]:
     if args.players:
         return list(args.players)
@@ -116,9 +255,20 @@ def build_agents(args: argparse.Namespace, players: list[str]) -> dict[str, Play
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             reasoning_effort=args.reasoning_effort,
+            discussion_message_max_chars=args.discussion_message_max_chars,
+            reasoning_summary_max_chars=args.reasoning_summary_max_chars,
         )
         for player, model in zip(players, args.models, strict=True)
     }
+
+
+def validate_budget_args(args: argparse.Namespace) -> None:
+    if args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive")
+    if args.discussion_message_max_chars <= 0:
+        raise ValueError("--discussion-message-max-chars must be positive")
+    if args.reasoning_summary_max_chars <= 0:
+        raise ValueError("--reasoning-summary-max-chars must be positive")
 
 
 def agent_metadata(agents: dict[str, PlayerAgent]) -> dict[str, dict[str, str]]:
