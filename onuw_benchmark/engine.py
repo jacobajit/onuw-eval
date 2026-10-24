@@ -356,6 +356,7 @@ class OneNightGame:
         killed_set = set(killed)
         werewolves = [player for player, role in table.items() if role == Role.WEREWOLF]
         killed_werewolves = [player for player in werewolves if player in killed_set]
+        tanner_killed = any(role == Role.TANNER and player in killed_set for player, role in table.items())
         any_player_killed = bool(killed)
         reasons: dict[str, str] = {}
         winners: set[str] = set()
@@ -371,13 +372,14 @@ class OneNightGame:
                     winners.add(player)
                     reasons[player] = "Village team killed at least one Werewolf"
         elif werewolves:
-            for player, role in table.items():
-                if role == Role.WEREWOLF:
-                    winners.add(player)
-                    reasons[player] = "Werewolf survived the vote"
-                elif role == Role.MINION:
-                    winners.add(player)
-                    reasons[player] = "Minion wins because no Werewolf was killed"
+            if not tanner_killed:
+                for player, role in table.items():
+                    if role == Role.WEREWOLF:
+                        winners.add(player)
+                        reasons[player] = "Werewolf survived the vote"
+                    elif role == Role.MINION:
+                        winners.add(player)
+                        reasons[player] = "Minion wins because no Werewolf was killed"
         elif not any_player_killed:
             for player, role in table.items():
                 if role not in {Role.MINION, Role.TANNER}:

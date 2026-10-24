@@ -435,7 +435,7 @@ def rules_summary(context: AgentContext) -> dict[str, Any]:
                     "If you are the only initial Werewolf, you may view exactly one center card."
                 ),
                 "actions": {"with_partners": ["none"], "lone_wolf": ["none", "view_center"]},
-                "goal": "Win if at least one final Werewolf exists and no final Werewolf is killed.",
+                "goal": "Win if at least one final Werewolf exists, no final Werewolf is killed, and no final Tanner is killed.",
             },
             "Seer": {
                 "team": "Village",
@@ -472,7 +472,7 @@ def rules_summary(context: AgentContext) -> dict[str, Any]:
                 "night": "See the initial Werewolf players. If the list is empty, no player started as Werewolf.",
                 "actions": ["none"],
                 "goal": (
-                    "If any final Werewolf exists, win when no final Werewolf is killed. "
+                    "If any final Werewolf exists, win when no final Werewolf and no final Tanner is killed. "
                     "If no final Werewolf exists, win only by surviving while at least one player is killed."
                 ),
             },
@@ -489,7 +489,10 @@ def rules_summary(context: AgentContext) -> dict[str, Any]:
             "Tanner": {
                 "team": "Tanner",
                 "night": "Does not wake or act.",
-                "goal": "Win if the final Tanner is killed. Tanner can win alongside another team.",
+                "goal": (
+                    "Win if the final Tanner is killed. If final Werewolves exist and the Tanner dies "
+                    "while no Werewolf dies, the Werewolves and Minion do not win."
+                ),
             },
         },
         "action_rules": {
@@ -520,10 +523,10 @@ def rules_summary(context: AgentContext) -> dict[str, Any]:
             "Cards after all night swaps are final roles and determine teams.",
             "Village roles win if at least one final Werewolf is killed.",
             "If no final Werewolves exist, Village roles win only if nobody is killed.",
-            "Final Werewolves win if at least one final Werewolf exists and no final Werewolf is killed.",
-            "Final Minions win with the Werewolves when final Werewolves exist and no final Werewolf is killed.",
+            "Final Werewolves win if at least one final Werewolf exists, no final Werewolf is killed, and no final Tanner is killed.",
+            "Final Minions win with the Werewolves when final Werewolves exist, no final Werewolf is killed, and no final Tanner is killed.",
             "If no final Werewolves exist, final Minions win only if they survive and at least one player is killed.",
-            "Final Tanner wins if the final Tanner is killed, and this does not prevent other eligible teams from also winning.",
+            "Final Tanner wins if the final Tanner is killed. If a final Werewolf is also killed, the Village wins too; if final Werewolves exist and none is killed, the Werewolves and Minion lose.",
         ],
         "current_step": {
             "player_id": context.player_id,

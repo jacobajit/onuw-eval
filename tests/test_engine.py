@@ -96,6 +96,26 @@ class EngineTests(unittest.TestCase):
         winners, _ = game._resolve_winners({"A": Role.TANNER, "B": Role.WEREWOLF, "C": Role.SEER}, ["A", "B"])
         self.assertEqual(winners, ["A", "C"])
 
+    def test_werewolves_and_minion_do_not_win_if_only_tanner_dies(self) -> None:
+        players = ["A", "B", "C", "D"]
+        config = GameConfig(
+            players=players,
+            role_deck=[Role.TANNER, Role.WEREWOLF, Role.MINION, Role.SEER, Role.ROBBER, Role.DRUNK, Role.VILLAGER],
+        )
+        game = OneNightGame(config)
+        table = {"A": Role.TANNER, "B": Role.WEREWOLF, "C": Role.MINION, "D": Role.SEER}
+        winners, reasons = game._resolve_winners(table, ["A"])
+        self.assertEqual(winners, ["A"])
+        self.assertNotIn("B", reasons)
+        self.assertNotIn("C", reasons)
+
+    def test_minion_still_wins_if_tanner_dies_and_no_werewolves_exist(self) -> None:
+        players = ["A", "B", "C"]
+        config = GameConfig(players=players, role_deck=[Role.TANNER, Role.MINION, Role.SEER, Role.WEREWOLF, Role.ROBBER, Role.DRUNK])
+        game = OneNightGame(config)
+        winners, _ = game._resolve_winners({"A": Role.TANNER, "B": Role.MINION, "C": Role.SEER}, ["A"])
+        self.assertEqual(winners, ["A", "B"])
+
     def test_discussion_context_does_not_reveal_hidden_final_role(self) -> None:
         players = ["A", "B", "C"]
         config = GameConfig(
